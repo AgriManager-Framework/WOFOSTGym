@@ -1,0 +1,17 @@
+AgroManagement:
+    SiteCalendar:
+        latitude: 50
+        longitude: 5
+        year: 1984
+        site_name: oregon
+        site_variation: oregon_1
+        site_start_date: 1985-03-01
+        site_end_date: 1985-10-01
+    CropCalendar:
+        crop_name: seed_onion
+        crop_variety: seed_onion_1
+        crop_start_date: 1985-03-01
+        crop_start_type: sowing
+        crop_end_date: 1985-09-01
+        crop_end_type: maturity
+        max_duration: 365

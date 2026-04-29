@@ -1,7 +1,7 @@
 """Utils file for making model configurations and setting parameters from arguments"""
 
 import gymnasium as gym
-from datetime import datetime
+from datetime import datetime, date
 from pcse_gym.args import WOFOST_Args, Agro_Args
 import yaml
 import numpy as np
@@ -1019,6 +1019,24 @@ def set_params(env: gym.Env, args: WOFOST_Args) -> None:
         env.parameterprovider.set_override("DVS_NPK_TRANSL", args.DVS_NPK_TRANSL, check=False)
 
 
+def _shift_agro_date_year(value: date, year_delta: int) -> date:
+    """Shift a ``date`` object by a whole-number year delta.
+
+    Agromanagement YAMLs encode concrete calendar dates anchored to a template
+    year. When callers override only ``year`` we still need the site/crop
+    start/end dates to move with that template. Preserve month/day when
+    possible and clamp leap-day values to February 28 on non-leap targets.
+    """
+    if not isinstance(value, date) or year_delta == 0:
+        return value
+    try:
+        return value.replace(year=value.year + year_delta)
+    except ValueError:
+        if value.month == 2 and value.day == 29:
+            return value.replace(year=value.year + year_delta, day=28)
+        raise
+
+
 def set_agro_params(agromanagement: dict, args: Agro_Args):
     """Sets editable Agromanagement parameters by modifying the agromanagement
     dictionary before being passed to the AgroManager Module
@@ -1031,7 +1049,18 @@ def set_agro_params(agromanagement: dict, args: Agro_Args):
     if args.longitude is not None:
         agromanagement["SiteCalendar"]["longitude"] = args.longitude
     if args.year is not None:
+        original_year = agromanagement["SiteCalendar"].get("year")
+        year_delta = int(args.year) - int(original_year) if original_year is not None else 0
         agromanagement["SiteCalendar"]["year"] = args.year
+        for section, key in (
+            ("SiteCalendar", "site_start_date"),
+            ("SiteCalendar", "site_end_date"),
+            ("CropCalendar", "crop_start_date"),
+            ("CropCalendar", "crop_end_date"),
+        ):
+            current_value = agromanagement.get(section, {}).get(key)
+            if isinstance(current_value, date):
+                agromanagement[section][key] = _shift_agro_date_year(current_value, year_delta)
     if args.site_name is not None:
         agromanagement["SiteCalendar"]["site_name"] = args.site_name
     if args.site_variation is not None:

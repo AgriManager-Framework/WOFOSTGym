@@ -57,10 +57,12 @@ from pcse import crop
 
 user_path = pathlib.Path(__file__).parent.resolve()
 
-# Make .pcse cache folder in the current working directory
-pcse_user_home = os.path.join(user_path, ".pcse")
+# Allow callers to override the PCSE cache location, otherwise keep the
+# package-local default used by this WOFOSTGym fork.
+pcse_user_home = os.environ.get("PCSE_USER_HOME", os.path.join(user_path, ".pcse"))
+meteo_cache_dir = os.environ.get(
+    "PCSE_METEO_CACHE_DIR",
+    os.path.join(pcse_user_home, "meteo_cache"),
+)
 os.makedirs(pcse_user_home, exist_ok=True)
-
-# Make folder in .pcse for weather data
-meteo_cache_dir = os.path.join(pcse_user_home, "meteo_cache")
 os.makedirs(meteo_cache_dir, exist_ok=True)

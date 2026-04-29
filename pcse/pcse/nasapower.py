@@ -9,6 +9,8 @@ import os
 import datetime as dt
 from math import exp
 import pathlib
+from contextlib import contextmanager
+import fcntl
 
 import numpy as np
 import pandas as pd
@@ -18,6 +20,25 @@ import pickle
 
 from pcse.util import reference_ET, check_angstromAB
 from pcse.utils import exceptions as exc
+
+
+def _nasapower_no_retrieve() -> bool:
+    value = os.environ.get("PCSE_NASAPOWER_NO_RETRIEVE", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+@contextmanager
+def _locked_cache_file(cache_fname: str):
+    """Serialize reads/writes for one NASA POWER cache file across workers."""
+    cache_path = pathlib.Path(cache_fname)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_path.with_name(cache_path.name + ".lock")
+    with open(lock_path, "w") as lock_fp:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
 
 # Define some lambdas to take care of unit conversions.
 MJ_to_J = lambda x: x * 1e6
@@ -143,7 +164,7 @@ class WeatherDataContainer(SlotPickleMixin):
         "TMIN": (-50.0, 60.0),
         "TMAX": (-50.0, 60.0),
         "VAP": (0.06, 199.3),  # hPa, computed as sat. vapour pressure at -50, 60 Celsius
-        "RAIN": (0, 35.0),
+        "RAIN": (0, 100.0),
         "E0": (0.0, 2.5),
         "ES0": (0.0, 2.5),
         "ET0": (0.0, 2.5),
@@ -291,9 +312,10 @@ class WeatherDataProvider(object):
 
         Dumps the values of self.store, longitude, latitude, elevation and description
         """
-        with open(cache_fname, "wb") as fp:
-            dmp = (self.store, self.elevation, self.longitude, self.latitude, self.description, self.ETmodel)
-            pickle.dump(dmp, fp, pickle.HIGHEST_PROTOCOL)
+        with _locked_cache_file(cache_fname):
+            with open(cache_fname, "wb") as fp:
+                dmp = (self.store, self.elevation, self.longitude, self.latitude, self.description, self.ETmodel)
+                pickle.dump(dmp, fp, pickle.HIGHEST_PROTOCOL)
 
     def _load(self, cache_fname: str) -> None:
         """Loads the contents from cache_fname using pickle.
@@ -302,8 +324,9 @@ class WeatherDataProvider(object):
         from cache_fname and also sets the self.first_date, self.last_date
         """
 
-        with open(cache_fname, "rb") as fp:
-            (store, self.elevation, self.longitude, self.latitude, self.description, ETModel) = pickle.load(fp)
+        with _locked_cache_file(cache_fname):
+            with open(cache_fname, "rb") as fp:
+                (store, self.elevation, self.longitude, self.latitude, self.description, ETModel) = pickle.load(fp)
 
         # Check if the reference ET from the cache file is calculated with the same model as
         # specified by self.ETmodel
@@ -524,12 +547,22 @@ class NASAPowerWeatherDataProvider(WeatherDataProvider):
         self.latitude = float(latitude)
         self.longitude = float(longitude)
         self.ETmodel = ETmodel
-        msg = "Retrieving weather data from NASA Power for lat/lon: (%f, %f)."
-        self.logger.info(msg % (self.latitude, self.longitude))
-
         # Check for existence of a cache file
         cache_file = self._find_cache_file(self.latitude, self.longitude)
+        no_retrieve = _nasapower_no_retrieve()
         if cache_file is None or force_update is True:
+            if no_retrieve:
+                if cache_file is None:
+                    raise FileNotFoundError(
+                        "NASA POWER cache-only mode is enabled and no cache file exists "
+                        "for lat/lon: (%f, %f)." % (self.latitude, self.longitude)
+                    )
+                raise exc.PCSEError(
+                    "NASA POWER cache-only mode is enabled; refusing forced retrieval "
+                    "for lat/lon: (%f, %f)." % (self.latitude, self.longitude)
+                )
+            msg = "Retrieving weather data from NASA Power for lat/lon: (%f, %f)."
+            self.logger.info(msg % (self.latitude, self.longitude))
             msg = "No cache file or forced update, getting data from NASA Power."
             self.logger.debug(msg)
             # No cache file, we really have to get the data from the NASA server
@@ -544,18 +577,35 @@ class NASAPowerWeatherDataProvider(WeatherDataProvider):
         cache_file_date = dt.date.fromtimestamp(r.st_mtime)
         age = (dt.date.today() - cache_file_date).days
         if age < 90:
+            msg = "Loading weather data from cache file for lat/lon: (%f, %f)."
+            self.logger.info(msg % (self.latitude, self.longitude))
             msg = "Start loading weather data from cache file: %s" % cache_file
             self.logger.debug(msg)
 
             status = self._load_cache_file()
             if status is not True:
+                if no_retrieve:
+                    raise exc.PCSEError(
+                        "NASA POWER cache-only mode is enabled and loading cache failed "
+                        "for lat/lon: (%f, %f)." % (self.latitude, self.longitude)
+                    )
+                msg = "Loading cache failed, retrieving weather data from NASA Power for lat/lon: (%f, %f)."
+                self.logger.warning(msg % (self.latitude, self.longitude))
                 msg = "Loading cache file failed, reloading data from NASA Power."
                 self.logger.debug(msg)
                 # Loading cache file failed!
                 self._get_and_process_NASAPower(self.latitude, self.longitude)
         else:
+            if no_retrieve:
+                status = self._load_cache_file()
+                if status is not True:
+                    msg = "Outdated cache file failed loading in cache-only mode."
+                    raise exc.PCSEError(msg)
+                return
             # Cache file is too old. Try loading new data from NASA
             try:
+                msg = "Refreshing stale weather cache from NASA Power for lat/lon: (%f, %f)."
+                self.logger.info(msg % (self.latitude, self.longitude))
                 msg = "Cache file older then 90 days, reloading data from NASA Power."
                 self.logger.debug(msg)
                 self._get_and_process_NASAPower(self.latitude, self.longitude)
@@ -644,7 +694,7 @@ class NASAPowerWeatherDataProvider(WeatherDataProvider):
         """Query the NASA Power server for data on given latitude/longitude"""
 
         start_date = dt.date(1983, 7, 1)
-        end_date = dt.date.today()
+        end_date = dt.date(2020, 12, 31)
 
         # build URL for retrieving data, using new NASA POWER api
         server = "https://power.larc.nasa.gov/api/temporal/daily/point"
@@ -657,13 +707,22 @@ class NASAPowerWeatherDataProvider(WeatherDataProvider):
             "end": end_date.strftime("%Y%m%d"),
             "community": "AG",
             "format": "JSON",
-            "user": "anonymous",
+            "user": "agrimanager",
         }
         msg = "Starting retrieval from NASA Power"
         self.logger.debug(msg)
-        req = requests.get(server, params=payload)
 
-        if req.status_code != self.HTTP_OK:
+        import time, random
+        max_retries = 10
+        for attempt in range(max_retries):
+            req = requests.get(server, params=payload)
+            if req.status_code == self.HTTP_OK:
+                break
+            if req.status_code == 429 and attempt < max_retries - 1:
+                wait = min(2 ** attempt, 60) + random.uniform(1, 5)
+                self.logger.debug(f"Rate limited (429), retrying in {wait:.1f}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(wait)
+                continue
             msg = ("Failed retrieving POWER data, server returned HTTP " + "code: %i on following URL %s") % (
                 req.status_code,
                 req.url,
@@ -695,8 +754,11 @@ class NASAPowerWeatherDataProvider(WeatherDataProvider):
         """
 
         user_path = pathlib.Path(__file__).parent.resolve()
-        PCSE_USER_HOME = os.path.join(user_path, ".pcse")
-        METEO_CACHE_DIR = os.path.join(PCSE_USER_HOME, "meteo_cache")
+        PCSE_USER_HOME = os.environ.get("PCSE_USER_HOME", os.path.join(user_path, ".pcse"))
+        METEO_CACHE_DIR = os.environ.get(
+            "PCSE_METEO_CACHE_DIR",
+            os.path.join(PCSE_USER_HOME, "meteo_cache"),
+        )
 
         fname = "%s_LAT%05i_LON%05i.cache" % (self.__class__.__name__, int(latitude * 10), int(longitude * 10))
         cache_filename = os.path.join(METEO_CACHE_DIR, fname)

@@ -1,0 +1,17 @@
+AgroManagement:
+    SiteCalendar:
+        latitude: 15
+        longitude: 5
+        year: 1984
+        site_name: oregon
+        site_variation: oregon_1
+        site_start_date: 1985-06-01
+        site_end_date: 1986-02-01
+    CropCalendar:
+        crop_name: pigeonpea
+        crop_variety: pigeonpea_1
+        crop_start_date: 1985-06-01
+        crop_start_type: sowing
+        crop_end_date: 1986-01-01
+        crop_end_type: maturity
+        max_duration: 400
